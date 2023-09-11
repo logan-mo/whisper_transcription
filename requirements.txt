@@ -3,3 +3,8 @@ transformers
 datasets
 huggingsound
 pandas
+soundfile
+librosa
+ffmpeg-python
+pygobject
+evaluate
