@@ -2,6 +2,15 @@ from google.cloud import storage
 import os
 import zipfile
 
+if not os.path.exists("data"):
+    os.mkdir("data")
+if not os.path.exists(os.path.join("data", "bismillah")):
+    os.mkdir(os.path.join("data", "bismillah"))
+if not os.path.exists("zip_files"):
+    os.mkdir("zip_files")
+if not os.path.exists("saved_model"):
+    os.mkdir("saved_model")
+
 storage_client = storage.Client("[whisper-arabic-transcription]")
 bucket = storage_client.get_bucket("recitation_dataset")
 blobs = list(storage_client.list_blobs("recitation_dataset"))
