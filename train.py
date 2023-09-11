@@ -31,7 +31,7 @@ def prepare_dataset(batch):
     return batch
 
 
-dataset = load_dataset("csv", data_files="final_dataset_linux.csv", split="train[:100]")
+dataset = load_dataset("csv", data_files="final_dataset_linux.csv", split="train")
 dataset = dataset.rename_columns({"path": "audio", "transcription": "text"})
 dataset = dataset.cast_column("audio", Audio(sampling_rate=16_000))
 dataset = dataset.map(prepare_dataset).remove_columns(["audio", "text"])
