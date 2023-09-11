@@ -1,7 +1,6 @@
 google-cloud-storage
 transformers
 datasets
-huggingsound
 pandas
 soundfile
 librosa
