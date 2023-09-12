@@ -2,16 +2,18 @@ from datasets import Dataset, load_dataset, Audio, DatasetDict, load_from_disk
 from transformers import (
     AutoProcessor,
     AutoModelForCTC,
-    Seq2SeqTrainingArguments,
-    Seq2SeqTrainer,
+    TrainingArguments,
+    Trainer,
 )
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Union, Optional
 from dataclasses import dataclass
 import pandas as pd
+import numpy as np
 import evaluate
 import librosa
 import torch
 import json
+import glob
 import os
 
 
@@ -20,147 +22,159 @@ processor = AutoProcessor.from_pretrained(
 )
 model = AutoModelForCTC.from_pretrained("jonatasgrosman/wav2vec2-large-xlsr-53-arabic")
 
+if len(glob.glob("processed_dataset/*")) == 0:
 
-def prepare_dataset(batch):
-    audio = batch["audio"]
-    batch = processor(
-        audio["array"], sampling_rate=audio["sampling_rate"], text=batch["text"]
+    def prepare_dataset(batch):
+        audio = batch["audio"]
+        # batched output is "un-batched"
+        batch["input_values"] = processor(
+            audio["array"], sampling_rate=audio["sampling_rate"]
+        ).input_values[0]
+        batch["input_length"] = len(batch["input_values"])
+        with processor.as_target_processor():
+            batch["labels"] = processor(batch["text"]).input_ids
+        return batch
+
+    dataset = load_dataset("csv", data_files="final_dataset_linux.csv", split="train")
+    dataset = dataset.rename_columns({"path": "audio", "transcription": "text"})
+    dataset = dataset.cast_column("audio", Audio(sampling_rate=16_000))
+    dataset = dataset.map(prepare_dataset).remove_columns(["audio", "text"])
+
+    train_test_dataset = dataset.train_test_split(test_size=0.1)
+    # Split the 10% test + valid in half test, half valid
+    test_valid = train_test_dataset["test"].train_test_split(test_size=0.5)
+    # gather everyone if you want to have a single DatasetDict
+    dataset = DatasetDict(
+        {
+            "train": train_test_dataset["train"],
+            "test": test_valid["test"],
+            "valid": test_valid["train"],
+        }
     )
 
-    batch["input_length"] = len(audio["array"]) / audio["sampling_rate"]
-    return batch
+    if not os.path.exists("processed_dataset"):
+        os.mkdir("processed_dataset")
 
-
-dataset = load_dataset("csv", data_files="final_dataset_linux.csv", split="train")
-dataset = dataset.rename_columns({"path": "audio", "transcription": "text"})
-dataset = dataset.cast_column("audio", Audio(sampling_rate=16_000))
-dataset = dataset.map(prepare_dataset).remove_columns(["audio", "text"])
-
-train_test_dataset = dataset.train_test_split(test_size=0.1)
-# Split the 10% test + valid in half test, half valid
-test_valid = train_test_dataset["test"].train_test_split(test_size=0.5)
-# gather everyone if you want to have a single DatasetDict
-train_test_valid_dataset = DatasetDict(
-    {
-        "train": train_test_dataset["train"],
-        "test": test_valid["test"],
-        "valid": test_valid["train"],
-    }
-)
-
-if not os.path.exists("processed_dataset"):
-    os.mkdir("processed_dataset")
-
-train_test_valid_dataset.save_to_disk("processed_dataset/")
-
-dataset = load_from_disk("processed_dataset/")
+    dataset.save_to_disk("processed_dataset/")
+else:
+    dataset = load_from_disk("processed_dataset/")
 
 
 @dataclass
-class DataCollatorSpeechSeq2SeqWithPadding:
-    processor: Any
+class DataCollatorCTCWithPadding:
+    """
+    Data collator that will dynamically pad the inputs received.
+    Args:
+        processor (:class:`~transformers.Wav2Vec2Processor`)
+            The processor used for proccessing the data.
+        padding (:obj:`bool`, :obj:`str` or :class:`~transformers.tokenization_utils_base.PaddingStrategy`, `optional`, defaults to :obj:`True`):
+            Select a strategy to pad the returned sequences (according to the model's padding side and padding index)
+            among:
+            * :obj:`True` or :obj:`'longest'`: Pad to the longest sequence in the batch (or no padding if only a single
+              sequence if provided).
+            * :obj:`'max_length'`: Pad to a maximum length specified with the argument :obj:`max_length` or to the
+              maximum acceptable input length for the model if that argument is not provided.
+            * :obj:`False` or :obj:`'do_not_pad'` (default): No padding (i.e., can output a batch with sequences of
+              different lengths).
+        max_length (:obj:`int`, `optional`):
+            Maximum length of the ``input_values`` of the returned list and optionally padding length (see above).
+        max_length_labels (:obj:`int`, `optional`):
+            Maximum length of the ``labels`` returned list and optionally padding length (see above).
+        pad_to_multiple_of (:obj:`int`, `optional`):
+            If set will pad the sequence to a multiple of the provided value.
+            This is especially useful to enable the use of Tensor Cores on NVIDIA hardware with compute capability >=
+            7.5 (Volta).
+    """
+
+    processor: processor
+    padding: Union[bool, str] = True
+    max_length: Optional[int] = None
+    max_length_labels: Optional[int] = None
+    pad_to_multiple_of: Optional[int] = None
+    pad_to_multiple_of_labels: Optional[int] = None
 
     def __call__(
         self, features: List[Dict[str, Union[List[int], torch.Tensor]]]
     ) -> Dict[str, torch.Tensor]:
-        # split inputs and labels since they have to be of different lengths and need different padding methods
-        # first treat the audio inputs by simply returning torch tensors
+        # split inputs and labels since they have to be of different lenghts and need
+        # different padding methods
         input_features = [
-            {"input_features": feature["input_features"][0]} for feature in features
+            {"input_values": feature["input_values"]} for feature in features
         ]
-        batch = self.processor.feature_extractor.pad(
-            input_features, return_tensors="pt"
-        )
-
-        # get the tokenized label sequences
         label_features = [{"input_ids": feature["labels"]} for feature in features]
-        # pad the labels to max length
-        labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
+
+        batch = self.processor.pad(
+            input_features,
+            padding=self.padding,
+            max_length=self.max_length,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            return_tensors="pt",
+        )
+        with self.processor.as_target_processor():
+            labels_batch = self.processor.pad(
+                label_features,
+                padding=self.padding,
+                max_length=self.max_length_labels,
+                pad_to_multiple_of=self.pad_to_multiple_of_labels,
+                return_tensors="pt",
+            )
 
         # replace padding with -100 to ignore loss correctly
         labels = labels_batch["input_ids"].masked_fill(
             labels_batch.attention_mask.ne(1), -100
         )
 
-        # if bos token is appended in previous tokenization step,
-        # cut bos token here as it's append later anyways
-        if (labels[:, 0] == self.processor.tokenizer.bos_token_id).all().cpu().item():
-            labels = labels[:, 1:]
-
         batch["labels"] = labels
 
         return batch
 
 
-data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor)
-metric = evaluate.load("wer")
+data_collator = DataCollatorCTCWithPadding(processor=processor, padding=True)
+wer_metric = evaluate.load("wer")
 
 
 def compute_metrics(pred):
-    pred_ids = pred.predictions
-    label_ids = pred.label_ids
+    pred_logits = pred.predictions
+    pred_ids = np.argmax(pred_logits, axis=-1)
 
-    # replace -100 with the pad_token_id
-    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+    pred.label_ids[pred.label_ids == -100] = processor.tokenizer.pad_token_id
 
+    pred_str = processor.batch_decode(pred_ids)
     # we do not want to group tokens when computing the metrics
-    pred_str = processor.batch_decode(pred_ids, skip_special_tokens=True)
-    label_str = processor.batch_decode(label_ids, skip_special_tokens=True)
+    label_str = processor.batch_decode(pred.label_ids, group_tokens=False)
 
-    # compute orthographic wer
-    wer_ortho = 100 * metric.compute(predictions=pred_str, references=label_str)
+    wer = wer_metric.compute(predictions=pred_str, references=label_str)
 
-    # compute normalised WER
-    pred_str_norm = pred_str
-    label_str_norm = label_str
-    # filtering step to only evaluate the samples that correspond to non-zero references:
-    pred_str_norm = [
-        pred_str_norm[i]
-        for i in range(len(pred_str_norm))
-        if len(label_str_norm[i]) > 0
-    ]
-    label_str_norm = [
-        label_str_norm[i]
-        for i in range(len(label_str_norm))
-        if len(label_str_norm[i]) > 0
-    ]
-
-    wer = 100 * metric.compute(predictions=pred_str_norm, references=label_str_norm)
-
-    return {"wer_ortho": wer_ortho, "wer": wer}
+    return {"wer": wer}
 
 
-training_args = Seq2SeqTrainingArguments(
-    output_dir="./saved_model",  # name on the HF Hub
+training_args = TrainingArguments(
+    output_dir="saved_model",
+    group_by_length=True,
     per_device_train_batch_size=16,
-    gradient_accumulation_steps=1,  # increase by 2x for every 2x decrease in batch size
-    learning_rate=1e-5,
-    lr_scheduler_type="constant_with_warmup",
-    warmup_steps=50,
-    max_steps=4000,  # increase to 4000 if you have your own GPU or a Colab paid plan
+    gradient_accumulation_steps=2,
+    evaluation_strategy="steps",
+    num_train_epochs=1,
     gradient_checkpointing=True,
     fp16=True,
-    fp16_full_eval=True,
-    evaluation_strategy="steps",
-    per_device_eval_batch_size=16,
-    predict_with_generate=True,
-    save_steps=500,
-    eval_steps=500,
-    load_best_model_at_end=True,
-    metric_for_best_model="wer",
-    greater_is_better=False,
+    save_steps=400,
+    eval_steps=400,
+    logging_steps=400,
+    learning_rate=3e-4,
+    warmup_steps=500,
+    save_total_limit=10,
     push_to_hub=False,
 )
 
 
-trainer = Seq2SeqTrainer(
-    args=training_args,
+trainer = Trainer(
     model=model,
+    data_collator=data_collator,
+    args=training_args,
+    compute_metrics=compute_metrics,
     train_dataset=dataset["train"],
     eval_dataset=dataset["valid"],
-    data_collator=data_collator,
-    compute_metrics=compute_metrics,
-    tokenizer=processor,
+    tokenizer=processor.feature_extractor,
 )
 
 
