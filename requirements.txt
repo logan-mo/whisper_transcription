@@ -6,3 +6,5 @@ soundfile
 librosa
 evaluate
 glob2
+jiwer
+accelerate
