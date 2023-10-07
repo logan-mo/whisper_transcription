@@ -154,3 +154,4 @@ cython_debug/
 
 data/
 processed_dataset/
+trained_model/
